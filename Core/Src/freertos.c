@@ -27,6 +27,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */     
 #include <stdbool.h>
+#include "usart.h"
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -44,22 +45,65 @@ pvector;
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
-#define CIRC_BUF_SZ (64) // must be power of two
+// this must be 16 due to the dma and usart hardware restriction? might be wrong
+#define RX_CIRC_BUF_SZ (256)
+#define UART8BYTES (sizeof(pvector)+2)
+
+// #define [header name] [code] // [extra receive bytes] [send back bytes] [kind]
+#define SCHEADER 0xF8  // 0 4 servo_idmode_scan
+#define RXHEADER 0xF7  // 0 74 Current servo vector
+#define RCHEADER 0xF6  // 0 pc_rx_buff[1] + 5 Remocon data
+#define IMHEADER 0xF5  // 0 20 IMU data
+#define PMHEADER 0xF4  // 0 110 servo's flag
+#define SPMHEADER 0xF3 // 0 66 servo's 64 parameter bytes
+#define BAHEADER 0xF2  // 5 8 balance
+#define TVHEADER 0xF1  // 72 74 Trim vector
+#define TMHEADER 0xF0  // 0 30 get time info
+#define COHEADER 0xEF  // 0 78 get control data
+#define GAHEADER 0xEE  // 28 30 gain parameters
+#define RFHEADER 0xED  // 0 3 rom_to_flash command
+#define FRHEADER 0xEC  // 0 3 flash_to_rom command
+#define ADHEADER 0xEB  // 0 4 ADC command
+// s is the number of attached sensors (summary: s * 9 + 1 < sendbytes < s * 38 + 1)
+#define JSHEADER 0xEA  // 0 s * (9 + [sum of the following bytes]) + 1 jointbase_sensorboard command
+#define JS_SW 0x01     // 0 1 jointbase_sensorboard subcommand switch bit
+#define JS_ADC 0x02    // 0 8 jointbase_sensorboard subcommand adc bit
+#define JS_PS 0x04     // 0 8 jointbase_sensorboard subcommand proximity sensor bit
+#define JS_GYRO 0x08   // 0 6 jointbase_sensorboard subcommand gyro bit
+#define JS_ACC 0x10    // 0 6 jointbase_sensorboard subcommand acc bit
+#define TSHEADER 0xE8  // 65 80
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
 /* USER CODE BEGIN PM */
-
+#define RX_DMA_WRITE_IDX ( (RX_CIRC_BUF_SZ - ((DMA_Stream_TypeDef *)huart_cobs->hdmarx->Instance)->NDTR) & (RX_CIRC_BUF_SZ - 1) )
 /* USER CODE END PM */
 
 /* Private variables ---------------------------------------------------------*/
 /* USER CODE BEGIN Variables */
-static uint8_t rx_dma_circ_buf[CIRC_BUF_SZ];
+static uint8_t rx_dma_circ_buf[RX_CIRC_BUF_SZ];
 static UART_HandleTypeDef *huart_cobs;
-// need variables
-#define DMA_WRITE_PTR ( (CIRC_BUF_SZ - __HAL_DMA_GET_COUNTER(huart_cobs->hdmarx)) & (CIRC_BUF_SZ - 1) )
-static uint32_t rd_ptr;
+static volatile uint32_t rd_idx;
 static uint8_t dma_char;
+
+/*!
+ * @brief rx header and data
+ * The first two bytes data from PC is the communication header.
+ * After that, fixed number of bytes will be sent.
+ * if header_received is true, it means the microprocessor is receiving data associated with the header.
+ * if header_received is false, it means the microprocessor is receiving header.
+ */
+
+static uint8_t pc_rx_buff[UART8BYTES] = {0};
+static uint32_t pc_rx_buff_idx = 0;
+typedef enum RXCommState
+{
+  RX_HEADER_RECEIVING = 0,
+  RX_DATA_RECEIVING,
+  RX_READY // data prepared
+} rx_comm_state_t;
+static rx_comm_state_t rx_comm_state = RX_HEADER_RECEIVING;
+
 /* USER CODE END Variables */
 osThreadId idleTaskHandle;
 osThreadId LED1TaskHandle;
@@ -84,6 +128,9 @@ osMessageQId J6vectorqueueHandle;
 void msgrx_init(UART_HandleTypeDef *huart);
 static bool msgrx_circ_buf_is_empty(void);
 static uint8_t msgrx_circ_buf_get(void);
+static void process_pc_rx_buff(void);
+static uint32_t get_rx_data_length_from_rx_header(void);
+static void process_pc_rx_1byte(uint8_t c);
 /* USER CODE END FunctionPrototypes */
 
 void StartidleTask(void const * argument);
@@ -215,13 +262,18 @@ __weak void StartidleTask(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-    while (msgrx_circ_buf_is_empty()) {
-    }
-    osDelay(100);
+    // ITM_SendChar('a');
+    // ITM_SendChar('\r');
+    // ITM_SendChar('\n');
+    //! @todo implement timeout feature.
     while (!msgrx_circ_buf_is_empty()) {
       dma_char = msgrx_circ_buf_get();
+      process_pc_rx_1byte(dma_char);
+      if (rx_comm_state == RX_READY) {
+        process_pc_rx_buff();
+      }
     }
-    osDelay(100);
+    osDelay(1);
   }
   /* USER CODE END StartidleTask */
 }
@@ -258,8 +310,8 @@ __weak void StartLED2Task(void const * argument)
   /* Infinite loop */
   for(;;)
   {
-	HAL_GPIO_TogglePin(LED1_GPIO_Port,LED1_Pin);
-	osDelay(600);
+  HAL_GPIO_TogglePin(LED1_GPIO_Port,LED1_Pin);
+  osDelay(600);
   }
   /* USER CODE END StartLED2Task */
 }
@@ -413,22 +465,137 @@ __weak void StartADCTask(void const * argument)
 void msgrx_init(UART_HandleTypeDef *huart)
 {
     huart_cobs = huart;
-    HAL_UART_Receive_DMA(huart_cobs, rx_dma_circ_buf, CIRC_BUF_SZ);
-    rd_ptr = 0;
+    HAL_UART_Receive_DMA(huart_cobs, rx_dma_circ_buf, RX_CIRC_BUF_SZ);
+    rd_idx = 0;
 }
 static bool msgrx_circ_buf_is_empty(void) {
-    if(rd_ptr == DMA_WRITE_PTR) {
-        return true;
-    }
-    return false;
+    return rd_idx == RX_DMA_WRITE_IDX;
 }
 static uint8_t msgrx_circ_buf_get(void) {
     uint8_t c = 0;
-    if(rd_ptr != DMA_WRITE_PTR) {
-        c = rx_dma_circ_buf[rd_ptr++];
-        rd_ptr &= (CIRC_BUF_SZ - 1);
+    if(!msgrx_circ_buf_is_empty()) {
+        c = rx_dma_circ_buf[rd_idx++];
+        rd_idx &= (RX_CIRC_BUF_SZ - 1);
     }
     return c;
+}
+
+static void process_pc_rx_1byte(uint8_t c)
+{
+  switch(rx_comm_state)
+  {
+  case RX_HEADER_RECEIVING:
+    pc_rx_buff[pc_rx_buff_idx++] = c;
+    if (pc_rx_buff_idx == 2) {
+      rx_comm_state = RX_DATA_RECEIVING;
+      if (get_rx_data_length_from_rx_header() == 2) {
+        rx_comm_state = RX_READY;
+      }
+    }
+    break;
+  case RX_DATA_RECEIVING:
+    pc_rx_buff[pc_rx_buff_idx++] = c;
+    if (pc_rx_buff_idx == get_rx_data_length_from_rx_header()) {
+      rx_comm_state = RX_READY;
+      pc_rx_buff_idx = 0;
+    }
+    break;
+  case RX_READY:
+    // should not enter here
+    break;
+  default:
+    // should not enter here
+    break;
+  }
+}
+
+// call when rx_header[2] is ready (rx_comm_state == RX_DATA_RECEIVING)
+static uint32_t get_rx_data_length_from_rx_header(void)
+{
+  switch (pc_rx_buff[0])
+  {
+  case BAHEADER:
+    return 7;
+  case TVHEADER:
+     return 74;
+  case GAHEADER:
+    return 30;
+  case TSHEADER: // m-hattori test
+    return 67;
+  default:
+    return 2;
+  }
+}
+
+static void process_pc_rx_buff(void)
+{
+  uint8_t tx_buff[256] = {0};
+  for (int i = 0; i < 256; i++) {
+	  tx_buff[i] = i + 1;
+  }
+  tx_buff[0] = 1;
+  tx_buff[1] = 2;
+  tx_buff[2] = 3;
+  tx_buff[3] = 4;
+  switch(pc_rx_buff[0])
+  {
+  case SCHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 4, HAL_MAX_DELAY);
+    break;
+  case RXHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 74, HAL_MAX_DELAY);
+    break;
+  case RCHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, pc_rx_buff[1] + 5, HAL_MAX_DELAY);
+    break;
+  case IMHEADER:
+    tx_buff[0] = 20;
+    HAL_UART_Transmit(&huart8, tx_buff, 20, HAL_MAX_DELAY);
+    break;
+  case PMHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 110, HAL_MAX_DELAY);
+    break;
+  case SPMHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 66, HAL_MAX_DELAY);
+    break;
+  case BAHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 8, HAL_MAX_DELAY);
+    break;
+  case TVHEADER:
+	 tx_buff[0] = 74;
+	 tx_buff[73] = 74;
+    HAL_UART_Transmit(&huart8, tx_buff, 74, HAL_MAX_DELAY);
+    break;
+  case TMHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 30, HAL_MAX_DELAY);
+    break;
+  case COHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 78, HAL_MAX_DELAY);
+    break;
+  case GAHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 30, HAL_MAX_DELAY);
+    break;
+  case RFHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 3, HAL_MAX_DELAY);
+    break;
+  case FRHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 3, HAL_MAX_DELAY);
+    break;
+  case ADHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 4, HAL_MAX_DELAY);
+    break;
+  case JSHEADER:
+    HAL_UART_Transmit(&huart8, tx_buff, 77, HAL_MAX_DELAY);
+    break;
+  case TSHEADER: // m-hattori test
+    for (size_t i = 0; i < 80; i++) {
+        tx_buff[i] = i + 1;
+    }
+    HAL_UART_Transmit(&huart8, tx_buff, 80, HAL_MAX_DELAY);
+    break;
+  default:
+    break;
+  }
 }
 
 /* USER CODE END Application */

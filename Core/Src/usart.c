@@ -146,9 +146,9 @@ void MX_UART8_Init(void)
   huart8.Init.OverSampling = UART_OVERSAMPLING_16;
   huart8.Init.OneBitSampling = UART_ONE_BIT_SAMPLE_DISABLE;
   huart8.Init.ClockPrescaler = UART_PRESCALER_DIV1;
-  huart8.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT|UART_ADVFEATURE_RXOVERRUNDISABLE_INIT;
+  huart8.AdvancedInit.AdvFeatureInit = UART_ADVFEATURE_SWAP_INIT|UART_ADVFEATURE_DMADISABLEONERROR_INIT;
   huart8.AdvancedInit.Swap = UART_ADVFEATURE_SWAP_ENABLE;
-  huart8.AdvancedInit.OverrunDisable = UART_ADVFEATURE_OVERRUN_DISABLE;
+  huart8.AdvancedInit.DMADisableonRxError = UART_ADVFEATURE_DMA_DISABLEONRXERROR;
   if (HAL_UART_Init(&huart8) != HAL_OK)
   {
     Error_Handler();
@@ -373,7 +373,7 @@ void HAL_UART_MspInit(UART_HandleTypeDef* uartHandle)
     hdma_uart8_rx.Init.PeriphDataAlignment = DMA_PDATAALIGN_BYTE;
     hdma_uart8_rx.Init.MemDataAlignment = DMA_MDATAALIGN_BYTE;
     hdma_uart8_rx.Init.Mode = DMA_CIRCULAR;
-    hdma_uart8_rx.Init.Priority = DMA_PRIORITY_LOW;
+    hdma_uart8_rx.Init.Priority = DMA_PRIORITY_MEDIUM;
     hdma_uart8_rx.Init.FIFOMode = DMA_FIFOMODE_DISABLE;
     if (HAL_DMA_Init(&hdma_uart8_rx) != HAL_OK)
     {
