@@ -85,7 +85,7 @@ static uint8_t rx_dma_circ_buf[RX_CIRC_BUF_SZ];
 static UART_HandleTypeDef *huart_cobs;
 static volatile uint32_t rd_idx;
 static uint8_t dma_char;
-
+uint8_t tx_buff[256] = {0};
 /*!
  * @brief rx header and data
  * The first two bytes data from PC is the communication header.
@@ -271,6 +271,7 @@ __weak void StartidleTask(void const * argument)
       process_pc_rx_1byte(dma_char);
       if (rx_comm_state == RX_READY) {
         process_pc_rx_buff();
+        rx_comm_state = RX_HEADER_RECEIVING;
       }
     }
     osDelay(1);
@@ -529,14 +530,7 @@ static uint32_t get_rx_data_length_from_rx_header(void)
 
 static void process_pc_rx_buff(void)
 {
-  uint8_t tx_buff[256] = {0};
-  for (int i = 0; i < 256; i++) {
-	  tx_buff[i] = i + 1;
-  }
-  tx_buff[0] = 1;
-  tx_buff[1] = 2;
-  tx_buff[2] = 3;
-  tx_buff[3] = 4;
+
   switch(pc_rx_buff[0])
   {
   case SCHEADER:
